@@ -100,6 +100,7 @@ public class Client implements Watcher, Closeable {
     
     void submitTask(String task, TaskObject taskCtx){
         taskCtx.setTask(task);
+        //Creates a task node to be assigned to a worker
         zk.create("/tasks/task-", 
                 task.getBytes(),
                 Ids.OPEN_ACL_UNSAFE,
@@ -138,6 +139,7 @@ public class Client implements Watcher, Closeable {
     
     void watchStatus(String path, Object ctx){
         ctxMap.put(path, ctx);
+        //Watches for the existence of a status node
         zk.exists(path, 
                 statusWatcher, 
                 existsCallback, 
@@ -149,7 +151,8 @@ public class Client implements Watcher, Closeable {
             if(e.getType() == EventType.NodeCreated) {
                 assert e.getPath().contains("/status/task-");
                 assert ctxMap.containsKey( e.getPath() );
-                
+
+                //Gets the data from the status node
                 zk.getData(e.getPath(), 
                         false, 
                         getDataCallback, 
@@ -167,6 +170,7 @@ public class Client implements Watcher, Closeable {
                 break;
             case OK:
                 if(stat != null){
+                    //Gets the data from the status node
                     zk.getData(path, false, getDataCallback, ctx);
                     LOG.info("Status node is there: " + path);
                 } 
@@ -206,11 +210,8 @@ public class Client implements Watcher, Closeable {
                 assert(ctx != null);
                 ((TaskObject) ctx).setStatus(taskResult.contains("done"));
                 
-                /*
-                 *  Delete status znode
-                 */
-                //zk.delete("/tasks/" + path.replace("/status/", ""), -1, taskDeleteCallback, null);
-                zk.delete(path, -1, taskDeleteCallback, null);
+
+                zk.delete(path, -1, statusDeleteCallback, null);
                 ctxMap.remove(path);
                 break;
             case NONODE:
@@ -223,11 +224,11 @@ public class Client implements Watcher, Closeable {
         }
     };
     
-    VoidCallback taskDeleteCallback = new VoidCallback(){
+    VoidCallback statusDeleteCallback = new VoidCallback(){
         public void processResult(int rc, String path, Object ctx){
             switch (Code.get(rc)) {
             case CONNECTIONLOSS:
-                zk.delete(path, -1, taskDeleteCallback, null);
+                zk.delete(path, -1, statusDeleteCallback, null);
                 break;
             case OK:
                 LOG.info("Successfully deleted " + path);

@@ -22,15 +22,11 @@ package org.apache.zookeeper.book;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Random;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.commons.lang3.SerializationUtils;
 import org.apache.zookeeper.AsyncCallback.ChildrenCallback;
 import org.apache.zookeeper.AsyncCallback.DataCallback;
 import org.apache.zookeeper.AsyncCallback.StatCallback;
@@ -113,6 +109,7 @@ public class Master implements Watcher, Closeable {
     
     protected ChildrenCache tasksCache;
     protected ChildrenCache workersCache;
+    protected ChildrenCache completedCache;
     
     /**
      * Creates a new master instance.
@@ -130,6 +127,7 @@ public class Master implements Watcher, Closeable {
      * @throws IOException
      */
     void startZK() throws IOException {
+        //Connects to the zookeeper server
         zk = new ZooKeeper(hostPort, 15000, this);
     }
 
@@ -139,6 +137,7 @@ public class Master implements Watcher, Closeable {
      * @throws IOException
      */
     void stopZK() throws InterruptedException, IOException {
+        //Closes the connection to the zookeeper server
         zk.close();
     }
     
@@ -176,13 +175,19 @@ public class Master implements Watcher, Closeable {
      * need to be executed a second time.
      */
     public void bootstrap(){
+        SerializationUtils su = new SerializationUtils();
+        HashMap<String, String> workerMap = new HashMap<>();
         createParent("/workers", new byte[0]);
         createParent("/assign", new byte[0]);
         createParent("/tasks", new byte[0]);
         createParent("/status", new byte[0]);
+        createParent("/completed", new byte[0]);
+        createParent("/keys", su.serialize(workerMap));
+        createParent("_locknode_", new byte[0]);
     }
     
     void createParent(String path, byte[] data){
+        //Creates a parent directory node
         zk.create(path, 
                 data, 
                 Ids.OPEN_ACL_UNSAFE, 
@@ -287,6 +292,7 @@ public class Master implements Watcher, Closeable {
     };
 
     void masterExists() {
+        //Sets a watch on the master node
         zk.exists("/master", 
                 masterExistsWatcher, 
                 masterExistsCallback, 
@@ -356,6 +362,7 @@ public class Master implements Watcher, Closeable {
      */
     public void runForMaster() {
         LOG.info("Running for master");
+        //Creates master node. If succesful, take over as master. If already exists, not master
         zk.create("/master", 
                 serverId.getBytes(), 
                 Ids.OPEN_ACL_UNSAFE, 
@@ -394,7 +401,7 @@ public class Master implements Watcher, Closeable {
         
     void checkMaster() {
         zk.getData("/master", false, masterCheckCallback, null);
-    }
+    } //Retrieves node data of master node to determine which server is the master
     
     /*
      ****************************************************
@@ -429,6 +436,7 @@ public class Master implements Watcher, Closeable {
     };
     
     void getWorkers(){
+        //Gets children of /workers node, all active worker nodes
         zk.getChildren("/workers", 
                 workersChangeWatcher, 
                 workersGetChildrenCallback, 
@@ -481,6 +489,7 @@ public class Master implements Watcher, Closeable {
     }
     
     void getAbsentWorkerTasks(String worker){
+        //Gets assigned tasks of worker that has been determined to have died.
         zk.getChildren("/assign/" + worker, false, workerAssignmentCallback, null);
     }
     
@@ -523,6 +532,7 @@ public class Master implements Watcher, Closeable {
      * @param task Task name excluding the path prefix
      */
     void getDataReassign(String path, String task) {
+        //Get data of task from dead worker
         zk.getData(path, 
                 false, 
                 getDataReassignCallback, 
@@ -572,6 +582,7 @@ public class Master implements Watcher, Closeable {
      * @param ctx Recreate text context
      */
     void recreateTask(RecreateTaskCtx ctx) {
+        //Recreates the task which was recovered from dead worker, process of task assignment begins again.
         zk.create("/tasks/" + ctx.task,
                 ctx.data,
                 Ids.OPEN_ACL_UNSAFE, 
@@ -614,8 +625,8 @@ public class Master implements Watcher, Closeable {
      */
     void deleteAssignment(String path){
         zk.delete(path, -1, taskDeletionCallback, null);
-    }
-    
+    } //Deletes old task assigned to dead worker
+
     VoidCallback taskDeletionCallback = new VoidCallback(){
         public void processResult(int rc, String path, Object rtx){
             switch(Code.get(rc)) {
@@ -651,11 +662,14 @@ public class Master implements Watcher, Closeable {
     };
     
     void getTasks(){
+        //Gets all tasks and sets watcher to watch for more
         zk.getChildren("/tasks", 
                 tasksChangeWatcher, 
                 tasksGetChildrenCallback, 
                 null);
     }
+
+    //TODO add completed watcher method
     
     ChildrenCallback tasksGetChildrenCallback = new ChildrenCallback() {
         public void processResult(int rc, String path, Object ctx, List<String> children){
@@ -693,6 +707,7 @@ public class Master implements Watcher, Closeable {
     }
 
     void getTaskData(String task) {
+        //Get data for a particular task
         zk.getData("/tasks/" + task, 
                 false, 
                 taskDataCallback, 
@@ -708,13 +723,30 @@ public class Master implements Watcher, Closeable {
                 break;
             case OK:
                 /*
-                 * Choose worker at random.
+                 * Choose worker depending on the task
                  */
-                List<String> list = workersCache.getList();
-                String designatedWorker = list.get(random.nextInt(list.size()));
+                String designatedWorker = "";
+                String taskData = new String(data);
+                if(taskData.startsWith("Insert") || taskData.startsWith("Calculate")) {
+                    List<String> list = workersCache.getList();
+                    designatedWorker = list.get(random.nextInt(list.size()));
+                }
+                else {
+                    String key = taskData.split(" ")[1];
+                    try {
+                        String nodePath = readLock();
+                        HashMap<String,String> workersMap = getHashMap();
+                        designatedWorker = workersMap.get(key);
+                        readUnlock(nodePath);
+                    } catch (KeeperException e) {
+                        e.printStackTrace();
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
                 
                 /*
-                 * Assign task to randomly chosen worker.
+                 * Assign task to randomly chosen or determined worker.
                  */
                 String assignmentPath = "/assign/" + 
                         designatedWorker + 
@@ -732,6 +764,7 @@ public class Master implements Watcher, Closeable {
     };
     
     void createAssignment(String path, byte[] data){
+        //Created a task node under the /assign/worker node of the assigned worker
         zk.create(path, 
                 data, 
                 Ids.OPEN_ACL_UNSAFE, 
@@ -749,6 +782,7 @@ public class Master implements Watcher, Closeable {
                 break;
             case OK:
                 LOG.info("Task assigned correctly: " + name);
+                //Task assigned, can be deleted from /tasks node
                 deleteTask(name.substring( name.lastIndexOf("/") + 1));
                 
                 break;
@@ -768,7 +802,7 @@ public class Master implements Watcher, Closeable {
      */
     void deleteTask(String name){
         zk.delete("/tasks/" + name, -1, taskDeleteCallback, null);
-    }
+    } //Deletes the task node under /tasks
     
     VoidCallback taskDeleteCallback = new VoidCallback(){
         public void processResult(int rc, String path, Object ctx){
@@ -788,6 +822,128 @@ public class Master implements Watcher, Closeable {
             default:
                 LOG.error("Something went wrong here, " + 
                         KeeperException.create(Code.get(rc), path));
+            }
+        }
+    };
+
+    Watcher completedChangeWatcher = new Watcher() {
+        public void process(WatchedEvent e) {
+            if(e.getType() == EventType.NodeChildrenChanged) {
+                assert "/completed".equals( e.getPath() );
+
+                getCompleted();
+            }
+        }
+    };
+
+    void getCompleted(){
+        //Gets all tasks and sets watcher to watch for more
+        zk.getChildren("/completed",
+                completedChangeWatcher,
+                completedGetChildrenCallback,
+                null);
+    }
+
+    ChildrenCallback completedGetChildrenCallback = new ChildrenCallback() {
+        public void processResult(int rc, String path, Object ctx, List<String> children){
+            switch(Code.get(rc)) {
+                case CONNECTIONLOSS:
+                    getCompleted();
+
+                    break;
+                case OK:
+                    List<String> toProcess;
+                    if(completedCache == null) {
+                        completedCache = new ChildrenCache(children);
+
+                        toProcess = children;
+                    } else {
+                        toProcess = completedCache.addedAndSet( children );
+                    }
+
+                    if(toProcess != null){
+                        makeStatus(toProcess);
+                    }
+
+                    break;
+                default:
+                    LOG.error("getChildren failed.",
+                            KeeperException.create(Code.get(rc), path));
+            }
+        }
+    };
+
+    void makeStatus(List<String> completedTasks) {
+        for(String completed : completedTasks){
+            statusNode(completed);
+        }
+    }
+
+    void statusNode(String completedTask) {
+        //Get data for a particular completed task
+        zk.getData("/completed/" + completedTask,
+                false,
+                completedDataCallback,
+                completedTask);
+    }
+
+    DataCallback completedDataCallback = new DataCallback() {
+        public void processResult(int rc, String path, Object ctx, byte[] data, Stat stat)  {
+            switch(Code.get(rc)) {
+                case CONNECTIONLOSS:
+                    statusNode((String) ctx);
+
+                    break;
+                case OK:
+                    path.replace("/completed/", "/status/");
+                    createStatus(path, data, ctx);
+                default:
+                    LOG.error("Error when trying to get completed data.",
+                            KeeperException.create(Code.get(rc), path));
+            }
+        }
+    };
+
+    void createStatus(String path, byte[] data, Object ctx) {
+        //Create the status node for a given task
+        zk.create(path, data, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT, statusCreatedCallback, ctx);
+    }
+
+    StringCallback statusCreatedCallback = new StringCallback() {
+        @Override
+        public void processResult(int rc, String path, Object ctx, String name) {
+            switch(Code.get(rc)) {
+                case CONNECTIONLOSS:
+                    createStatus(path, new byte[0], ctx);
+                    break;
+                case OK:
+                    path.replace("/status/", "/completed/");
+                    deleteCompleted(path);
+                    LOG.info("Status node created");
+                    break;
+                default:
+                    LOG.error("Error while trying to create status node.");
+            }
+        }
+    };
+
+    void deleteCompleted(String path) {
+        //Delete the completed node for a given task
+        zk.delete(path, -1, deleteCompletedCallback, null);
+    }
+
+    VoidCallback deleteCompletedCallback = new VoidCallback() {
+        @Override
+        public void processResult(int rc, String path, Object ctx) {
+            switch(Code.get(rc)) {
+                case CONNECTIONLOSS:
+                    deleteCompleted(path);
+                    break;
+                case OK:
+                    LOG.info("Completed Node Deleted Succesfully");
+                    break;
+                default:
+                    LOG.error("Error while trying to delete completed node");
             }
         }
     };
@@ -836,5 +992,92 @@ public class Master implements Watcher, Closeable {
         }   
 
         m.stopZK();
-    }    
+    }
+
+    public String readLock() throws KeeperException, InterruptedException {
+        //Creates read lock node
+        String newLock = zk.create("_locknode_/read-", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+        int lockNum = Integer.parseInt(newLock.split("-")[1]);
+        //Gets all children of lock node to determine if the resource can be acquired
+        List<String> locks = zk.getChildren("_locknode", false);
+        boolean writeLocked = false;
+        int writeNum = Integer.MIN_VALUE;
+        for(String lock: locks) {
+            int currentNum;
+            if(lock.startsWith("write") && (currentNum = Integer.parseInt(lock.split("-")[1])) < lockNum) {
+                writeLocked = true;
+                if(currentNum > writeNum) {
+                    writeNum = currentNum;
+                }
+            }
+        }
+        if(writeLocked) {
+            //Waits for current lock node to be deleted, check for existence
+            Stat stat = zk.exists("_locknode_/write-" + writeNum, false);
+            while(stat != null) {
+                Thread.sleep(1000);
+                stat = zk.exists("_locknode_/write-" + writeNum, false);
+            }
+            return newLock;
+        }
+        else {
+            return newLock;
+        }
+    }
+
+    public void readUnlock(String nodePath) throws KeeperException, InterruptedException {
+        //Deletes my lock node, effectively freeing resource
+        zk.delete(nodePath, -1);
+    }
+
+    public String writeLock() throws KeeperException, InterruptedException {
+        //Creates a write lock node under the /locknode node in an attempt to acquire resource
+        String newLock = zk.create("_locknode_/write-", new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+        int lockNum = Integer.parseInt(newLock.split("-")[1]);
+        //Gets a list of all children of the lock node in order to determine if it is able to acquire resource
+        List<String> locks = zk.getChildren("_locknode", false);
+        boolean readLocked = false;
+        int readNum = Integer.MIN_VALUE;
+        for(String lock: locks) {
+            int currentNum;
+            if(lock.startsWith("read") && (currentNum = Integer.parseInt(lock.split("-")[1])) < lockNum) {
+                readLocked = true;
+                if(currentNum > readNum) {
+                    readNum = currentNum;
+                }
+            }
+        }
+        if(readLocked) {
+            //Checks for existence of current lock node to know when it can acquire resource
+            Stat stat = zk.exists("_locknode_/read-" + readNum, true);
+            while(stat != null) {
+                Thread.sleep(1000);
+                stat = zk.exists("_locknode_/read-" + readNum, false);
+            }
+            return newLock;
+        }
+        else {
+            return newLock;
+        }
+    }
+
+    public void writeUnlock(String nodePath) throws KeeperException, InterruptedException {
+        //Deletes my lock node effectively freeing resource
+        zk.delete(nodePath, -1);
+    }
+
+    public HashMap<String, String> getHashMap() throws KeeperException, InterruptedException {
+        SerializationUtils su = new SerializationUtils();
+        //gets key-worker hashmap from /keys node (currently serialized
+        byte[] bytes = zk.getData("/keys", false, null);
+        HashMap<String, String> hm = su.deserialize(bytes);
+        return hm;
+    }
+
+    public void rewriteHashMap(HashMap<String, String> hm) throws KeeperException, InterruptedException {
+        SerializationUtils su = new SerializationUtils();
+        byte[] bytes = su.serialize(hm);
+        //sets serialized version of updated key-worker hashmap as the data of the /keys node
+        zk.setData("/keys", bytes, -1);
+    }
 }
